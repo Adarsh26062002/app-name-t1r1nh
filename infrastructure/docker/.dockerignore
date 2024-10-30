@@ -1,0 +1,49 @@
+# Development and build artifacts
+node_modules
+dist
+build
+*.log
+*.tmp
+*.bak
+tsconfig.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Version control and IDE files
+.git
+.vscode
+.idea
+.DS_Store
+
+# Environment and configuration files
+.env
+.env.*
+.eslintrc*
+.prettierrc*
+
+# Docker files (to prevent recursive copying)
+Dockerfile
+Dockerfile.dev
+docker-compose.yml
+docker-compose.dev.yml
+
+# Test files and directories
+__tests__
+*.test.ts
+*.spec.ts
+test-results
+jest-cache
+coverage
+
+# Temporary and cache directories
+tmp
+logs
+
+# Documentation
+README.md
+CHANGELOG.md
+
+# Addresses requirement: Containerization - Optimizes Docker image builds by excluding unnecessary files
+# Addresses requirement: Deployment Architecture - Supports multiple container types (Test Runner, Report Generator, DB Tools)
+# Addresses requirement: Deployment Environment - Configures build context for different deployment environments
