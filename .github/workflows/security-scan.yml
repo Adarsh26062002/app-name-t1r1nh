@@ -1,0 +1,139 @@
+# Comprehensive Security Scan Workflow for Jump Testing Framework
+# Implements requirements from system_architecture.security_architecture and security_considerations.security_testing
+# Version: 1.0.0
+
+name: Security Scan
+
+# Trigger on push to main, pull requests, and weekly schedule as per security requirements
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Weekly security scan execution on Sunday at midnight
+    - cron: '0 0 * * 0'
+
+# Environment variables from specification
+env:
+  NODE_ENV: ci
+  SECURITY_SCAN_LEVEL: high
+  CODEQL_LANGUAGES: '["javascript", "typescript"]'
+
+# Define jobs
+jobs:
+  securityScan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    # Wait for prerequisite jobs to complete
+    needs: [build, unit-tests, integration-tests]
+
+    steps:
+      # Check out repository with security patches
+      - name: Checkout Repository
+        uses: actions/checkout@v3  # v3 for latest security patches
+        with:
+          fetch-depth: 0  # Full history for better vulnerability detection
+
+      # Set up Node.js environment for security scanning
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16.x'  # LTS version
+          cache: 'npm'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Initialize CodeQL analysis environment
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: ${{ env.CODEQL_LANGUAGES }}
+          queries: security-extended,security-and-quality
+
+      # Run dependency security checks
+      - name: Run Dependency Security Check
+        uses: ./.github/workflows/dependency-check.yml
+        with:
+          fail-on-severity: high
+
+      # Static Application Security Testing (SAST)
+      - name: Run CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+        with:
+          category: "/language:javascript,typescript"
+
+      # Secret scanning
+      - name: Run Secret Scanning
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          config-path: .gitleaks.toml
+          fail-on: high
+
+      # Software Composition Analysis (SCA)
+      - name: Run NPM Audit
+        run: |
+          cd src/backend
+          npm audit --audit-level=${{ env.SECURITY_SCAN_LEVEL }}
+          if [ $? -eq 1 ]; then
+            echo "High severity vulnerabilities found!"
+            exit 1
+          fi
+
+      # Dynamic Application Security Testing (DAST)
+      - name: Run OWASP ZAP Scan
+        uses: zaproxy/action-full-scan@v0.4.0
+        with:
+          target: 'http://localhost:3000'
+          fail_on_high: true
+
+      # Generate comprehensive security report
+      - name: Generate Security Report
+        run: |
+          echo "# Security Scan Report" > security-report.md
+          echo "## CodeQL Analysis Results" >> security-report.md
+          cat codeql-results.sarif >> security-report.md
+          echo "## Dependency Check Results" >> security-report.md
+          cat dependency-check-report.json >> security-report.md
+          echo "## OWASP ZAP Results" >> security-report.md
+          cat zap-scan-results.json >> security-report.md
+
+      # Upload security scan results as artifacts
+      - name: Upload Security Scan Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-scan-results
+          path: |
+            security-report.md
+            codeql-results.sarif
+            dependency-check-report.json
+            zap-scan-results.json
+          retention-days: 30
+
+      # Post results to GitHub Security tab
+      - name: Upload to Security Tab
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: codeql-results.sarif
+
+      # Fail workflow if high-severity vulnerabilities detected
+      - name: Check for Critical Vulnerabilities
+        run: |
+          if grep -q "high\|critical" security-report.md; then
+            echo "Critical security vulnerabilities detected!"
+            exit 1
+          fi
+
+      # Notify security team on failure
+      - name: Notify on Failure
+        if: failure()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const issue = {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🚨 Security Scan Failed',
+              body: 'High severity security vulnerabilities detected. Immediate attention required.',
+              labels: ['security', 'high-priority']
+            }
+            await github.rest.issues.create(issue)
