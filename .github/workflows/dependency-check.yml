@@ -1,0 +1,151 @@
+# GitHub Actions workflow for dependency security checks and updates verification
+# Runs on push to main/develop branches, pull requests, and weekly schedule
+# Version: 1.0.0
+
+name: Dependency Security Check
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - '**/package.json'
+      - '**/package-lock.json'
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - '**/package.json'
+      - '**/package-lock.json'
+  schedule:
+    # Run weekly on Sunday at midnight
+    - cron: '0 0 * * 0'
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+
+jobs:
+  dependency-check:
+    name: Security Audit & Version Check
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checkout repository with complete history for better vulnerability tracking
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      # Setup Node.js LTS environment as per security requirements
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16.x'
+          cache: 'npm'
+
+      # Configure npm audit level
+      - name: Configure npm audit settings
+        run: npm set audit-level high
+
+      # Cache npm dependencies for faster workflow execution
+      - name: Cache npm dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      # Install dependencies with security flags
+      - name: Install Dependencies
+        run: npm ci --ignore-scripts
+        working-directory: src/backend
+
+      # Run npm audit for security vulnerabilities
+      - name: Run npm security audit
+        run: |
+          echo "Running npm audit..."
+          npm audit
+          if [ $? -eq 1 ]; then
+            echo "High severity vulnerabilities found!"
+            exit 1
+          fi
+        working-directory: src/backend
+
+      # Check for outdated dependencies
+      - name: Check outdated dependencies
+        run: npm outdated
+        working-directory: src/backend
+        continue-on-error: true
+
+      # Verify TypeScript version compliance
+      - name: Verify TypeScript version
+        run: |
+          TS_VERSION=$(npm list typescript | grep typescript | cut -d@ -f2)
+          if [ $(echo $TS_VERSION | cut -d. -f1) -lt 4 ] || [ $(echo $TS_VERSION | cut -d. -f2) -lt 8 ]; then
+            echo "TypeScript version must be >= 4.8"
+            exit 1
+          fi
+        working-directory: src/backend
+
+      # Deep security scan with Snyk
+      - name: Run Snyk Security Scan
+        uses: snyk/actions/node@v3
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+
+      # Check license compliance
+      - name: Check License Compliance
+        run: |
+          echo "Checking license compliance..."
+          npm ls --json | jq -r '.dependencies | to_entries[] | select(.value.license == null or .value.license == "UNLICENSED") | .key' > non_compliant_licenses.txt
+          if [ -s non_compliant_licenses.txt ]; then
+            echo "Found packages with non-compliant licenses:"
+            cat non_compliant_licenses.txt
+            exit 1
+          fi
+        working-directory: src/backend
+
+      # Generate dependency audit report
+      - name: Generate Audit Report
+        run: |
+          echo "# Dependency Audit Report" > audit_report.md
+          echo "## Security Vulnerabilities" >> audit_report.md
+          npm audit --json | jq -r '.advisories | to_entries[] | "* \(.value.title) - \(.value.severity)"' >> audit_report.md
+          echo "## Outdated Dependencies" >> audit_report.md
+          npm outdated --json | jq -r 'to_entries[] | "* \(.key): \(.value.current) -> \(.value.latest)"' >> audit_report.md
+        working-directory: src/backend
+
+      # Post audit results on pull request
+      - name: Post Audit Results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('src/backend/audit_report.md', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
+
+      # Upload security results to GitHub Security tab
+      - name: Upload Security Results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: snyk.sarif
+        if: always()
+
+      # Fail if high severity issues found
+      - name: Check for Critical Issues
+        run: |
+          if [ -f "src/backend/audit_report.md" ] && grep -q "critical\|high" "src/backend/audit_report.md"; then
+            echo "Critical or high severity issues found in dependencies!"
+            exit 1
+          fi
