@@ -1,0 +1,182 @@
+# GitHub Actions workflow for production deployment
+# Implements requirements from:
+# - system_architecture.deployment_architecture
+# - infrastructure.ci/cd_pipeline
+# - system_architecture.component_dependencies
+
+name: Production Deployment
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+  workflow_dispatch:
+    inputs:
+      deploy_version:
+        description: 'Version tag to deploy'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-west-2
+  ECS_CLUSTER_NAME: test-framework-prod-cluster
+  RDS_INSTANCE_IDENTIFIER: test-framework-prod-db
+  ENVIRONMENT: production
+  DEPLOY_TIMEOUT: 3600
+  HEALTH_CHECK_RETRIES: 5
+
+jobs:
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency: production_environment
+    
+    permissions:
+      id-token: write
+      contents: read
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          
+      # Setup Node.js for AWS CDK deployment
+      - name: Setup Node.js
+        uses: actions/setup-node@v3 # v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          
+      # Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1 # v1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      # Setup Terraform
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1 # v1
+        with:
+          terraform_version: '1.5.0'
+          
+      # Login to Amazon ECR
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v1 # v1
+        id: ecr-login
+        
+      # Setup environment variables
+      - name: Setup environment
+        run: |
+          chmod +x infrastructure/scripts/setup-env.sh
+          source infrastructure/scripts/setup-env.sh production
+          echo "DOCKER_REGISTRY=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> $GITHUB_ENV
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          
+      # Validate deployment prerequisites
+      - name: Validate prerequisites
+        run: |
+          chmod +x infrastructure/scripts/deploy.sh
+          ./infrastructure/scripts/deploy.sh validatePrerequisites
+          
+      # Build and push Docker images
+      - name: Build and push Docker images
+        uses: docker/build-push-action@v2 # v2
+        with:
+          context: .
+          file: infrastructure/docker/Dockerfile
+          push: true
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/test-framework:production
+            ${{ env.DOCKER_REGISTRY }}/test-framework:latest
+          build-args: |
+            ENVIRONMENT=production
+            NODE_ENV=production
+            AWS_REGION=${{ env.AWS_REGION }}
+            
+      # Deploy AWS infrastructure
+      - name: Deploy infrastructure
+        run: |
+          npm install -g aws-cdk@2.88.0
+          cd infrastructure/aws
+          npm ci
+          source ../../infrastructure/scripts/deploy.sh deployInfrastructure
+        env:
+          CDK_DEFAULT_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
+          
+      # Configure Datadog monitoring
+      - name: Configure Datadog monitoring
+        uses: datadog/action-datadog-monitor@v1 # v1
+        with:
+          api-key: ${{ secrets.DATADOG_API_KEY }}
+          app-key: ${{ secrets.DATADOG_APP_KEY }}
+          monitor-name: "Production Deployment Monitor"
+          monitor-type: "metric alert"
+          monitor-query: "avg(last_5m):avg:aws.ecs.service.running{cluster:${{ env.ECS_CLUSTER_NAME }}} < 1"
+          monitor-message: "Production deployment failed - ECS service not running"
+          
+      # Health checks
+      - name: Run health checks
+        run: |
+          # Check ECS service status
+          attempts=0
+          while [ $attempts -lt ${{ env.HEALTH_CHECK_RETRIES }} ]; do
+            if aws ecs describe-services \
+              --cluster ${{ env.ECS_CLUSTER_NAME }} \
+              --services test-framework-service \
+              --query 'services[0].runningCount' \
+              --output text | grep -q "^[1-9]"; then
+              echo "ECS service is running"
+              break
+            fi
+            attempts=$((attempts + 1))
+            sleep 60
+          done
+          
+          if [ $attempts -eq ${{ env.HEALTH_CHECK_RETRIES }} ]; then
+            echo "Health check failed - ECS service not running"
+            exit 1
+          fi
+          
+          # Check RDS instance status
+          if ! aws rds describe-db-instances \
+            --db-instance-identifier ${{ env.RDS_INSTANCE_IDENTIFIER }} \
+            --query 'DBInstances[0].DBInstanceStatus' \
+            --output text | grep -q "available"; then
+            echo "Health check failed - RDS instance not available"
+            exit 1
+          fi
+          
+      # Rollback on failure
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          source infrastructure/scripts/deploy.sh rollback
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          
+      # Notify deployment status
+      - name: Notify deployment status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            message="Production deployment completed successfully"
+          else
+            message="Production deployment failed"
+          fi
+          
+          aws sns publish \
+            --topic-arn "arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:deployment-notifications" \
+            --message "$message"
+
+permissions:
+  id-token: write
+  contents: read
