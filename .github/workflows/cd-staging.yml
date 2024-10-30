@@ -1,0 +1,201 @@
+# CD Staging Workflow for Jump Testing Framework
+# Version: 1.0.0
+# This workflow implements the continuous deployment pipeline for the staging environment
+# with comprehensive build, test, package, and deployment stages.
+
+name: CD Staging
+
+on:
+  push:
+    branches:
+      - develop
+      - staging
+  workflow_dispatch:
+
+env:
+  # Node.js version as specified in globals
+  NODE_VERSION: '18'
+  # Docker registry configuration
+  DOCKER_REGISTRY: ${{ secrets.AWS_ACCOUNT }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+  IMAGE_NAME: jump-testing-framework
+  # AWS configuration
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  # Environment
+  ENVIRONMENT: staging
+  # Terraform working directory
+  TF_WORKING_DIR: ./infrastructure/terraform
+
+jobs:
+  # Build job: Compiles TypeScript and runs initial validations
+  build:
+    name: Build and Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2 # v2 as specified in external dependencies
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v2 # v2 as specified in external dependencies
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: |
+          npm ci
+          npm audit
+
+      - name: TypeScript Build
+        run: npm run build
+
+      - name: Lint Check
+        run: npm run lint
+
+      - name: Cache Build Artifacts
+        uses: actions/cache@v2
+        with:
+          path: |
+            dist
+            node_modules
+          key: ${{ runner.os }}-build-${{ github.sha }}
+
+  # Test job: Runs comprehensive test suite
+  test:
+    needs: build
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore Cache
+        uses: actions/cache@v2
+        with:
+          path: |
+            dist
+            node_modules
+          key: ${{ runner.os }}-build-${{ github.sha }}
+
+      - name: Run Unit Tests
+        run: npm run test:unit -- --ci --coverage
+
+      - name: Run Integration Tests
+        run: npm run test:integration -- --ci
+
+      - name: Upload Test Coverage
+        uses: actions/upload-artifact@v2
+        with:
+          name: coverage-report
+          path: coverage/
+
+  # Package job: Builds and pushes Docker image
+  package:
+    needs: test
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1 # v1 as specified in external dependencies
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v1 # v1 as specified in external dependencies
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v2 # v2 as specified in external dependencies
+        with:
+          context: .
+          file: ./infrastructure/docker/Dockerfile
+          push: true
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:staging-latest
+
+  # Deploy job: Deploys to staging environment
+  deploy:
+    needs: package
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2 # v2 as specified in external dependencies
+        with:
+          terraform_version: 1.0.0
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var="environment=staging" \
+            -var="image_tag=${{ github.sha }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Run Smoke Tests
+        run: |
+          chmod +x ./infrastructure/scripts/test.sh
+          ./infrastructure/scripts/test.sh --environment staging
+
+      - name: Send Deployment Notification
+        uses: slackapi/slack-github-action@v1.23.0 # v1.23.0 as specified in external dependencies
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: "Deployment to staging environment completed\nCommit: ${{ github.sha }}\nWorkflow: ${{ github.workflow }}"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  # Post-deployment verification
+  verify:
+    needs: deploy
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Health Check
+        run: |
+          for i in {1..5}; do
+            if curl -s -f https://staging-api.example.com/health; then
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+
+      - name: Update Deployment Status
+        if: always()
+        uses: slackapi/slack-github-action@v1.23.0
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: "Staging deployment verification ${{ job.status }}\nEnvironment: staging\nCommit: ${{ github.sha }}"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
